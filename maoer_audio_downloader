@@ -1,0 +1,364 @@
+// ==UserScript==
+// @name         Maoer Audio Downloader
+// @namespace    http://tampermonkey.net/
+// @version      3.0
+// @description  Tải Audio (lấy link m3u8 và giải mã xuất .m4a) kèm ô nhập DRM Key
+// @author       Yen Di Trach
+// @match        https://www.missevan.com/sound/player?id=*
+// @match        https://www.missevan.com/sound/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @connect      missevan.com
+// @connect      127.0.0.1
+// @connect      localhost
+// @connect      *
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ==========================================
+    // 0. CHÈN CSS ANIMATION CHO ICON CHUYỂN ĐỘNG
+    // ==========================================
+    const customStyles = `
+        /* Hiệu ứng lắc qua lại (Wiggle/Sway) */
+        @keyframes iconWiggle {
+            0%   { transform: rotate(0deg) scale(1); }
+            25%  { transform: rotate(-12deg) scale(1.1); }
+            50%  { transform: rotate(0deg) scale(1); }
+            75%  { transform: rotate(12deg) scale(1.1); }
+            100% { transform: rotate(0deg) scale(1); }
+        }
+
+        /* Hiệu ứng nhún nhảy lên xuống (Bounce) */
+        @keyframes iconBounce {
+            0%, 100% { transform: translateY(0); }
+            50%      { transform: translateY(-4px); }
+        }
+
+        /* Áp dụng animation cho icon */
+        .animated-icon-swing {
+            display: inline-block;
+            animation: iconWiggle 2s infinite ease-in-out;
+        }
+
+        .animated-icon-swing-fast {
+            display: inline-block;
+            animation: iconWiggle 1s infinite ease-in-out;
+        }
+
+        .animated-icon-bounce {
+            display: inline-block;
+            animation: iconBounce 1.5s infinite ease-in-out;
+        }
+
+        /* Trang trí icon góc floating */
+        .deco-icon-top-left {
+            position: absolute;
+            top: -10px;
+            left: -8px;
+            font-size: 16px;
+            pointer-events: none;
+        }
+
+        .deco-icon-top-right {
+            position: absolute;
+            top: -10px;
+            right: -8px;
+            font-size: 16px;
+            pointer-events: none;
+        }
+
+        .deco-icon-bottom-left {
+            position: absolute;
+            bottom: -10px;
+            left: -8px;
+            font-size: 16px;
+            pointer-events: none;
+        }
+
+        .deco-icon-bottom-right {
+            position: absolute;
+            bottom: -10px;
+            right: -8px;
+            font-size: 16px;
+            pointer-events: none;
+        }
+    `;
+
+    if (typeof GM_addStyle !== 'undefined') {
+        GM_addStyle(customStyles);
+    } else {
+        const styleNode = document.createElement('style');
+        styleNode.textContent = customStyles;
+        document.head.appendChild(styleNode);
+    }
+
+    // Global Constants
+    const SOUND_GET_URL = "https://www.missevan.com/sound/getsound";
+    const WIDEVINE_PROXY_URL = "http://127.0.0.1:8080/get_key";
+    const LOCAL_HELPER_URL = "http://127.0.0.1:5000/download";
+
+    // Helper Functions
+    const cleanFilename = (name) => name ? name.toString().replace(/[<>:"/\\|?*]+/g, '_').trim() : "";
+
+    function fetchData(url, type = 'json') {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: url,
+                responseType: type,
+                headers: { "Referer": window.location.href },
+                onload: res => {
+                    if (res.status !== 200) return reject(`Request failed: ${res.status} ${res.statusText}`);
+                    if (type === 'json' && (res.response === null || res.response === undefined)) {
+                        return reject(`Phản hồi không phải JSON hợp lệ`);
+                    }
+                    resolve(res.response);
+                },
+                onerror: err => reject(`Network error: ${err}`)
+            });
+        });
+    }
+
+    // 1. Lấy Sound ID từ URL
+    function getSoundId() {
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.has('id')) return urlParams.get('id');
+        if (urlParams.has('soundid')) return urlParams.get('soundid');
+        const match = window.location.pathname.match(/\/sound\/(\d+)/);
+        return match ? match[1] : null;
+    }
+
+    // 2. Lấy thông tin Sound từ API
+    async function getSoundInfo(id) {
+        try {
+            const data = await fetchData(`${SOUND_GET_URL}?soundid=${id}`, 'json');
+            let rawName = data?.info?.sound?.soundstr;
+
+            if (!rawName) {
+                const domTitle = document.title;
+                if (domTitle) rawName = domTitle.split('-')[0].trim();
+            }
+
+            const name = cleanFilename(rawName || `sound_${id}`);
+            const soundObj = data?.info?.sound || {};
+            const m3u8Url = soundObj.soundurl_128 || soundObj.soundurl_64 || soundObj.soundurl || null;
+
+            return { name, m3u8Url };
+        } catch (error) {
+            console.error(`Lỗi lấy thông tin Sound ID ${id}:`, error);
+            return { name: `sound_${id}`, m3u8Url: null };
+        }
+    }
+
+    // 3. Gửi dữ liệu tới Local Helper Server giaima.py
+    function sendToLocalHelper(soundInfo, soundId, keyString) {
+        console.log(`🔑 Key được sử dụng: ${keyString}`);
+        console.log("🚀 Đang gửi dữ liệu sang giaima.py...");
+
+        const btn = document.querySelector('#missevan-audio-btn');
+        if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = `<span class="animated-icon-swing-fast">⏳</span> Đang gửi lệnh...`;
+        }
+
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: LOCAL_HELPER_URL,
+            headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            },
+            data: JSON.stringify({
+                url: soundInfo.m3u8Url,
+                key: keyString,
+                title: `${soundId}_${soundInfo.name}`
+            }),
+            timeout: 8000,
+            onload: function (res) {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = `Tải Audio (.M4A)`;
+                }
+                if (res.status === 200) {
+                    try {
+                        const result = JSON.parse(res.responseText);
+                        alert(`✅ ${result.message || 'Đã gửi lệnh tải thành công!'}`);
+                    } catch(e) {
+                        alert(`✅ Đã gửi lệnh tải thành công!`);
+                    }
+                } else {
+                    alert(`❌ Server Python báo lỗi HTTP ${res.status}!\nHãy kiểm tra lại Terminal.`);
+                }
+            },
+            ontimeout: function () {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = `Tải Audio (.M4A)`;
+                }
+                alert("⏰ Quá thời gian chờ (Timeout)!\nHãy kiểm tra lại Terminal python3 giaima.py.");
+            },
+            onerror: function (err) {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = `Tải Audio (.M4A)`;
+                }
+                console.error("Lỗi kết nối:", err);
+                alert("❌ Không thể kết nối tới giaima.py (Port 5000)!\nHãy chắc chắn bạn đã chạy lệnh: python3 giaima.py");
+            }
+        });
+    }
+
+    // 4. Xử lý Tải Audio
+    async function autoDownloadAudio() {
+        const soundId = getSoundId();
+        if (!soundId) return alert("❌ Không tìm thấy Sound ID!");
+
+        const soundInfo = await getSoundInfo(soundId);
+        if (!soundInfo.m3u8Url) return alert("❌ Không tìm thấy link soundurl_128!");
+
+        const manualKeyInput = document.getElementById('missevan-drm-key-input');
+        const manualKey = manualKeyInput ? manualKeyInput.value.trim() : "";
+
+        if (manualKey) {
+            sendToLocalHelper(soundInfo, soundId, manualKey);
+            return;
+        }
+
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: WIDEVINE_PROXY_URL,
+            headers: { "Content-Type": "application/json" },
+            data: JSON.stringify({ url: soundInfo.m3u8Url, sound_id: soundId }),
+            onload: function (response) {
+                if (response.status === 200) {
+                    let keyString = "";
+                    try {
+                        const result = JSON.parse(response.responseText);
+                        keyString = result.key;
+                    } catch (e) {
+                        keyString = response.responseText.trim();
+                    }
+                    sendToLocalHelper(soundInfo, soundId, keyString);
+                } else {
+                    alert("❌ Không lấy được Key từ WidevineProxy2!\nHãy dán Key trực tiếp vào ô '🔑 DRM Key (Thủ công)' rồi bấm tải lại.");
+                }
+            },
+            onerror: function () {
+                alert("❌ Lỗi kết nối tới WidevineProxy2 (127.0.0.1:8080)!\n💡 Hãy copy Key dán vào ô '🔑 DRM Key (Thủ công)' để tải trực tiếp.");
+            }
+        });
+    }
+
+    // 5. Giao diện bảng điều khiển
+    function addDownloadUI() {
+        if (document.getElementById('missevan-downloader-box')) return;
+
+        const box = document.createElement('div');
+        box.id = 'missevan-downloader-box';
+        box.style.cssText = `
+            position: fixed;
+            top: 60px;
+            left: 20px;
+            z-index: 99999;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            background: rgba(245, 249, 255, 0.95);
+            padding: 12px;
+            border-radius: 10px;
+            border: 2px solid #a3c6ff;
+            box-shadow: 0 4px 10px rgba(138,182,255,0.5);
+            font-family: sans-serif;
+            width: 230px;
+        `;
+
+        // 1. Icon Góc Trên Bên Trái
+        const decoTopLeft = document.createElement('span');
+        decoTopLeft.className = 'deco-icon-top-left animated-icon-swing';
+        decoTopLeft.innerText = '✨';
+        box.appendChild(decoTopLeft);
+
+        // 2. Icon Góc Trên Bên Phải
+        const decoTopRight = document.createElement('span');
+        decoTopRight.className = 'deco-icon-top-right animated-icon-swing';
+        decoTopRight.innerText = '🎧';
+        box.appendChild(decoTopRight);
+
+        // 3. Icon Góc Dưới Bên Trái
+        const decoBottomLeft = document.createElement('span');
+        decoBottomLeft.className = 'deco-icon-bottom-left animated-icon-swing';
+        decoBottomLeft.innerText = '🎧';
+        box.appendChild(decoBottomLeft);
+
+        // 4. Icon Góc Dưới Bên Phải
+        const decoBottomRight = document.createElement('span');
+        decoBottomRight.className = 'deco-icon-bottom-right animated-icon-swing';
+        decoBottomRight.innerText = '✨';
+        box.appendChild(decoBottomRight);
+
+        // Tiêu đề với Icon lắc qua lại
+        const title = document.createElement('div');
+        title.innerHTML = `<span class="animated-icon-swing">🎵</span> Maoer Audio Downloader <span class="animated-icon-swing">🎵</span>`;
+        title.style.cssText = "font-weight: bold; color: #78abff; font-size: 13px; text-align: center; margin-bottom: 2px;";
+        box.appendChild(title);
+
+        // Nút tải Audio
+        const btn = document.createElement('button');
+        btn.id = 'missevan-audio-btn';
+        btn.innerHTML = 'Tải Audio (.M4A)';
+        btn.onclick = autoDownloadAudio;
+        btn.style.cssText = `
+            padding: 8px 10px;
+            background-color: #78abff;
+            color: #ffffff;
+            border: none;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 12px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        `;
+        btn.onmouseover = () => btn.style.opacity = "0.85";
+        btn.onmouseout = () => btn.style.opacity = "1";
+        box.appendChild(btn);
+
+        // Ô nhập DRM Key thủ công
+        const keyContainer = document.createElement('div');
+        keyContainer.style.cssText = "display: flex; flex-direction: column; gap: 2px; margin-top: 2px;";
+
+        const keyLabel = document.createElement('label');
+        keyLabel.innerHTML = `<span class="animated-icon-bounce">🔑</span> DRM Key (Thủ công):`;
+        keyLabel.style.cssText = "font-size: 10px; color: #78abff; font-weight: bold;";
+
+        const keyInput = document.createElement('input');
+        keyInput.id = 'missevan-drm-key-input';
+        keyInput.type = 'text';
+        keyInput.placeholder = 'KID:KEY (VD: a182...:5...)';
+        keyInput.style.cssText = `
+            padding: 5px 6px;
+            font-size: 10px;
+            border: 1px solid #78abff;
+            border-radius: 4px;
+            outline: none;
+            background: #fff;
+            width: 100%;
+            box-sizing: border-box;
+        `;
+
+        keyContainer.appendChild(keyLabel);
+        keyContainer.appendChild(keyInput);
+        box.appendChild(keyContainer);
+
+        document.body.appendChild(box);
+    }
+
+    // Gắn UI khi trang tải xong
+    if (document.readyState === 'complete') {
+        addDownloadUI();
+    } else {
+        window.addEventListener('load', addDownloadUI);
+    }
+
+})();
